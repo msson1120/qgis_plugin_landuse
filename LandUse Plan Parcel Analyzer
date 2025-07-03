@@ -1,0 +1,104 @@
+# QGIS 파이썬 콘솔에서 바로 실행할 수 있는 테스트 코드
+# 아래에서 레이어 이름을 실제 QGIS에 로드된 레이어명으로 바꿔주세요.
+
+import pandas as pd
+from qgis.core import QgsProject, QgsVectorLayer, QgsField, QgsFeature
+from qgis.PyQt.QtCore import QVariant
+import processing
+
+# ── 1. 엑셀에서 '지번'→'등기면적' 맵 생성 ──────────────────────────
+excel_path = r"D:/손명선 사원/00.기타/12.ai TF/04.AI솔루션 제작/02. 등기부등본 자동정리/1/250703_면적보정_test.xlsx"
+df = pd.read_excel(
+    excel_path,
+    sheet_name='1. 소유지분현황 (갑구)', # ← 정확한 시트명으로 수정
+    usecols=['토지주소', '토지면적'],
+    header=1
+)
+df.columns = ['지번', '등기면적']
+df = df.dropna(subset=['지번','등기면적'])
+df['지번'] = df['지번'].astype(str).str.strip()
+df['등기면적'] = pd.to_numeric(df['등기면적'], errors='coerce')
+df = df.dropna(subset=['등기면적'])
+deed_area_map = dict(zip(df['지번'], df['등기면적']))
+print(f"  • 엑셀 매핑 건수: {len(deed_area_map)}")
+
+# ── 2. 레이어 로드 ─────────────────────────────────────────
+land_use_layer = QgsProject.instance().mapLayersByName('토지이용계획안')[0]
+parcel_layer  = QgsProject.instance().mapLayersByName('연속지적도')[0]
+
+fields = [
+    QgsField("Layer", QVariant.String),
+    QgsField("지번", QVariant.String),
+    QgsField("블럭내면적", QVariant.Double),
+    QgsField("전체면적", QVariant.Double),
+    QgsField("포함율", QVariant.Double),
+    QgsField("등기면적", QVariant.Double),
+    QgsField("보정면적", QVariant.Double)
+]
+
+crs = land_use_layer.crs().authid()
+uri = f"Polygon?crs={crs}"
+result_layer = QgsVectorLayer(uri, "토지이용계획_필지분석_클립", "memory")
+provider = result_layer.dataProvider()
+provider.addAttributes(fields)
+result_layer.updateFields()
+
+# 3. 연속지적도 필지별 전체면적 딕셔너리 생성
+parcel_area_dict = {}
+for f in parcel_layer.getFeatures():
+    parcel_no = f["지번"] if "지번" in f.fields().names() else str(f.id())
+    parcel_area_dict[parcel_no] = f.geometry().area()
+
+params = {
+    'INPUT': land_use_layer,
+    'OUTPUT': 'memory:'
+}
+land_use_polygons = processing.run("qgis:linestopolygons", params)['OUTPUT']
+
+for land_use_feat in land_use_polygons.getFeatures():
+    land_use_geom = land_use_feat.geometry()
+    # geometry 오류 보정
+    if not land_use_geom or land_use_geom.isEmpty():
+        continue
+    land_use_geom = land_use_geom.buffer(0, 1)
+    if not land_use_geom or land_use_geom.isEmpty():
+        continue
+    # 임시 단일 피처 레이어 생성
+    temp_layer = QgsVectorLayer(f"Polygon?crs={crs}", "temp", "memory")
+    temp_provider = temp_layer.dataProvider()
+    temp_feat = QgsFeature()
+    temp_feat.setGeometry(land_use_geom)
+    temp_provider.addFeatures([temp_feat])
+    temp_layer.updateExtents()
+    # 블럭별로 필지 레이어를 클립
+    clip_result = processing.run("qgis:clip", {
+        'INPUT': parcel_layer,
+        'OVERLAY': temp_layer,
+        'OUTPUT': 'memory:clip'
+    })['OUTPUT']
+    for clipped_feat in clip_result.getFeatures():
+        new_feat = QgsFeature()
+        new_feat.setGeometry(clipped_feat.geometry())
+        parcel_no = clipped_feat["지번"] if "지번" in clipped_feat.fields().names() else str(clipped_feat.id())
+        block_area = round(land_use_geom.area(), 2)
+        clip_area = round(clipped_feat.geometry().area(), 2)
+        parcel_area = round(parcel_area_dict.get(parcel_no, clip_area), 2)
+        percent = round((clip_area / parcel_area) * 100, 2) if parcel_area > 0 else 0
+        deed_area = round(deed_area_map.get(parcel_no, 0), 2)
+        adj_area  = round(clip_area * (deed_area/parcel_area), 2) if parcel_area > 0 else 0
+        attrs = [
+            land_use_feat["Layer"] if "Layer" in land_use_feat.fields().names() else str(land_use_feat.id()),
+            parcel_no,
+            clip_area,
+            parcel_area,
+            percent,
+            deed_area,
+            adj_area
+        ]
+        new_feat.setAttributes(attrs)
+        provider.addFeature(new_feat)
+
+result_layer.updateExtents()
+QgsProject.instance().addMapLayer(result_layer)
+
+print('클립+등기면적 보정 분석이 완료되었습니다. 결과 레이어가 추가되었습니다.')
