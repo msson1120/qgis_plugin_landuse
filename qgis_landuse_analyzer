@@ -1,0 +1,55 @@
+# QGIS 파이썬 콘솔에서 바로 실행할 수 있는 테스트 코드
+# 아래에서 레이어 이름을 실제 QGIS에 로드된 레이어명으로 바꿔주세요.
+
+from qgis.core import QgsProject, QgsVectorLayer, QgsField, QgsFeature
+from qgis.PyQt.QtCore import QVariant
+import processing
+
+# 입력 레이어 이름을 실제 QGIS에 로드된 레이어명으로 변경하세요
+land_use_layer = QgsProject.instance().mapLayersByName('토지이용계획안')[0]  # 라인 레이어
+parcel_layer = QgsProject.instance().mapLayersByName('연속지적도')[0]      # 폴리곤 레이어
+
+fields = [
+    QgsField("Layer", QVariant.String),  # 용도명
+    QgsField("지번", QVariant.String),    # 필지 지번
+    QgsField("블럭내면적", QVariant.Double),
+    QgsField("전체면적", QVariant.Double),
+    QgsField("포함율", QVariant.Double)
+]
+
+crs = land_use_layer.crs().authid()
+uri = f"Polygon?crs={crs}"
+result_layer = QgsVectorLayer(uri, "토지이용계획_필지분석결과", "memory")
+provider = result_layer.dataProvider()
+provider.addAttributes(fields)
+result_layer.updateFields()
+
+params = {
+    'INPUT': land_use_layer,
+    'OUTPUT': 'memory:'
+}
+land_use_polygons = processing.run("qgis:linestopolygons", params)['OUTPUT']
+
+for land_use_feat in land_use_polygons.getFeatures():
+    land_use_geom = land_use_feat.geometry()
+    for parcel_feat in parcel_layer.getFeatures():
+        parcel_geom = parcel_feat.geometry()
+        if land_use_geom.intersects(parcel_geom):
+            intersection = land_use_geom.intersection(parcel_geom)
+            if not intersection.isEmpty():
+                new_feat = QgsFeature()
+                new_feat.setGeometry(intersection)
+                attrs = [
+                    land_use_feat["Layer"],
+                    parcel_feat["지번"],
+                    intersection.area(),
+                    parcel_geom.area(),
+                    (intersection.area() / parcel_geom.area()) * 100
+                ]
+                new_feat.setAttributes(attrs)
+                provider.addFeature(new_feat)
+
+result_layer.updateExtents()
+QgsProject.instance().addMapLayer(result_layer)
+
+print('분석이 완료되었습니다. 결과 레이어가 추가되었습니다.')
