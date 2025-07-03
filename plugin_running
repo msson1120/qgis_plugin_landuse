@@ -1,0 +1,203 @@
+### ParcelAnalyzerPlugin
+
+This plugin allows users to:
+- Select two input layers:
+  1. Land Use Plan (Line)
+  2. Continuous Cadastre (Polygon)
+- Browse for an Excel registry file
+- Clip parcels by each land-use block
+- Correct areas using registry-recorded parcel areas
+
+
+
+#### 1. metadata.txt
+[general]
+name=ParcelAnalyzerPlugin
+qgisMinimumVersion=3.0
+description=Clip parcels by land use blocks and correct area with registry Excel
+version=0.1
+author=AI TF
+email=example@example.com
+
+#### 2. __init__.py
+from .plugin import ParcelAnalyzerPlugin
+
+def classFactory(iface):
+    return ParcelAnalyzerPlugin(iface)
+
+#### 3. plugin.py
+import os
+from qgis.PyQt.QtWidgets import QAction
+from qgis.core import QgsProject
+from .dialog import ParcelAnalyzerDialog
+
+class ParcelAnalyzerPlugin:
+    def __init__(self, iface):
+        self.iface = iface
+        self.action = None
+        self.dialog = None
+
+    def initGui(self):
+        self.action = QAction("Parcel Analyzer", self.iface.mainWindow())
+        self.action.triggered.connect(self.run)
+        self.iface.addToolBarIcon(self.action)
+        self.iface.addPluginToMenu("&Parcel Analyzer", self.action)
+
+    def unload(self):
+        self.iface.removeToolBarIcon(self.action)
+        self.iface.removePluginMenu("&Parcel Analyzer", self.action)
+
+    def run(self):
+        if not self.dialog:
+            self.dialog = ParcelAnalyzerDialog(self.iface)
+        self.dialog.show()
+        self.dialog.exec_()
+
+#### 4. dialog.py
+import os
+import pandas as pd
+from qgis.PyQt.QtWidgets import QDialog, QFileDialog
+from qgis.PyQt.QtCore import QVariant
+from qgis.core import (
+    QgsProject, QgsVectorLayer, QgsFeature, QgsField, QgsWkbTypes
+)
+import processing
+from .dialog_ui import Ui_ParcelAnalyzerDialog
+
+class ParcelAnalyzerDialog(QDialog, Ui_ParcelAnalyzerDialog):
+    def __init__(self, iface, parent=None):
+        super().__init__(parent)
+        self.iface = iface
+        self.setupUi(self)
+        # Populate layer dropdowns
+        for lyr in QgsProject.instance().mapLayers().values():
+            if isinstance(lyr, QgsVectorLayer):
+                if lyr.geometryType() == QgsWkbTypes.LineGeometry:
+                    self.comboLandUse.addItem(lyr.name())
+                if lyr.geometryType() == QgsWkbTypes.PolygonGeometry:
+                    self.comboParcel.addItem(lyr.name())
+        self.btnBrowse.clicked.connect(self.chooseExcel)
+        self.btnRun.clicked.connect(self.runAnalysis)
+
+    def chooseExcel(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Registry Excel", "", "Excel files (*.xlsx *.xls)"
+        )
+        if path:
+            self.lineExcel.setText(path)
+
+    def runAnalysis(self):
+        # 1. Read inputs
+        lu_name     = self.comboLandUse.currentText()
+        parcel_name= self.comboParcel.currentText()
+        excel_path = self.lineExcel.text()
+        # 2. Load layers
+        land_use_layer = QgsProject.instance().mapLayersByName(lu_name)[0]
+        parcel_layer   = QgsProject.instance().mapLayersByName(parcel_name)[0]
+        crs = land_use_layer.crs().authid()
+        # 3. Parse registry Excel
+        df = pd.read_excel(
+            excel_path,
+            sheet_name='1. 소유지분현황 (갑구)',
+            usecols=['토지주소','토지면적'],
+            header=1
+        )
+        df.columns = ['지번','등기면적']
+        df = df.dropna(subset=['지번','등기면적'])
+        df['지번'] = df['지번'].astype(str).str.strip()
+        df['등기면적'] = pd.to_numeric(df['등기면적'], errors='coerce')
+        df = df.dropna(subset=['등기면적'])
+        deed_area_map = dict(zip(df['지번'], df['등기면적']))
+
+        # 4. Prepare result layer
+        fields = [
+            QgsField("Layer", QVariant.String),
+            QgsField("지번", QVariant.String),
+            QgsField("블럭내면적", QVariant.Double),
+            QgsField("전체면적", QVariant.Double),
+            QgsField("포함율", QVariant.Double),
+            QgsField("등기면적", QVariant.Double),
+            QgsField("보정면적", QVariant.Double)
+        ]
+        uri = f"Polygon?crs={crs}"
+        result = QgsVectorLayer(uri, "Parcel_Analysis_Adjusted", "memory")
+        prov = result.dataProvider()
+        prov.addAttributes(fields)
+        result.updateFields()
+
+        # 5. Compute parcel full areas
+        parcel_area = { 
+            (f['지번'] if '지번' in f.fields().names() else str(f.id())): f.geometry().area() 
+            for f in parcel_layer.getFeatures() }
+
+        # 6. Convert line to polygon
+        polys = processing.run(
+            'qgis:linestopolygons',
+            {'INPUT': land_use_layer, 'OUTPUT':'memory:'}
+        )['OUTPUT']
+
+        # 7. Clip & calculate
+        for blk in polys.getFeatures():
+            g_blk = blk.geometry()
+            if g_blk.isEmpty(): continue
+            g_blk = g_blk.buffer(0,1)
+            temp = QgsVectorLayer(f"Polygon?crs={crs}", "tmp", "memory")
+            tmpprov = temp.dataProvider()
+            feat = QgsFeature()
+            feat.setGeometry(g_blk)
+            tmpprov.addFeatures([feat])
+            temp.updateExtents()
+            clip = processing.run(
+                'qgis:clip',
+                {'INPUT': parcel_layer, 'OVERLAY': temp, 'OUTPUT':'memory:clip'}
+            )['OUTPUT']
+            for f in clip.getFeatures():
+                no = f['지번'] if '지번' in f.fields().names() else str(f.id())
+                clip_area = f.geometry().area()
+                total = parcel_area.get(no, clip_area)
+                pct = clip_area/total*100 if total>0 else 0
+                deed = deed_area_map.get(no, 0)
+                adj = clip_area*(deed/total) if total>0 else 0
+                new = QgsFeature(result.fields())
+                new.setGeometry(f.geometry())
+                new.setAttributes([
+                    blk['Layer'], no, clip_area, total, pct, deed, adj
+                ])
+                prov.addFeature(new)
+
+        result.updateExtents()
+        QgsProject.instance().addMapLayer(result)
+        self.iface.messageBar().pushMessage(
+            "Parcel Analyzer", "Analysis complete", level=0
+        )
+
+#### 5. dialog_ui.py (generated from Qt Designer)
+# -*- coding: utf-8 -*-
+from PyQt5 import QtCore, QtGui, QtWidgets
+
+class Ui_ParcelAnalyzerDialog(object):
+    def setupUi(self, Dialog):
+        Dialog.setObjectName("Dialog")
+        Dialog.resize(400, 200)
+        self.verticalLayout = QtWidgets.QVBoxLayout(Dialog)
+        self.label1 = QtWidgets.QLabel(Dialog)
+        self.label1.setText("Land Use Plan (Line)")
+        self.verticalLayout.addWidget(self.label1)
+        self.comboLandUse = QtWidgets.QComboBox(Dialog)
+        self.verticalLayout.addWidget(self.comboLandUse)
+        self.label2 = QtWidgets.QLabel(Dialog)
+        self.label2.setText("Parcel Layer (Polygon)")
+        self.verticalLayout.addWidget(self.label2)
+        self.comboParcel = QtWidgets.QComboBox(Dialog)
+        self.verticalLayout.addWidget(self.comboParcel)
+        self.horizontalLayout = QtWidgets.QHBoxLayout()
+        self.lineExcel = QtWidgets.QLineEdit(Dialog)
+        self.horizontalLayout.addWidget(self.lineExcel)
+        self.btnBrowse = QtWidgets.QPushButton(Dialog)
+        self.btnBrowse.setText("Browse Excel...")
+        self.horizontalLayout.addWidget(self.btnBrowse)
+        self.verticalLayout.addLayout(self.horizontalLayout)
+        self.btnRun = QtWidgets.QPushButton(Dialog)
+        self.btnRun.setText("Run Analysis")
+        self.verticalLayout.addWidget(self.btnRun)
+        QtCore.QMetaObject.connectSlotsByName(Dialog)
