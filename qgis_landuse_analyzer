@@ -19,10 +19,16 @@ fields = [
 
 crs = land_use_layer.crs().authid()
 uri = f"Polygon?crs={crs}"
-result_layer = QgsVectorLayer(uri, "토지이용계획_필지분석결과", "memory")
+result_layer = QgsVectorLayer(uri, "토지이용계획_필지분석_클립", "memory")
 provider = result_layer.dataProvider()
 provider.addAttributes(fields)
 result_layer.updateFields()
+
+# 1. 연속지적도 필지별 전체면적 딕셔너리 생성
+parcel_area_dict = {}
+for f in parcel_layer.getFeatures():
+    parcel_no = f["지번"] if "지번" in f.fields().names() else str(f.id())
+    parcel_area_dict[parcel_no] = f.geometry().area()
 
 params = {
     'INPUT': land_use_layer,
@@ -32,24 +38,45 @@ land_use_polygons = processing.run("qgis:linestopolygons", params)['OUTPUT']
 
 for land_use_feat in land_use_polygons.getFeatures():
     land_use_geom = land_use_feat.geometry()
-    for parcel_feat in parcel_layer.getFeatures():
-        parcel_geom = parcel_feat.geometry()
-        if land_use_geom.intersects(parcel_geom):
-            intersection = land_use_geom.intersection(parcel_geom)
-            if not intersection.isEmpty():
-                new_feat = QgsFeature()
-                new_feat.setGeometry(intersection)
-                attrs = [
-                    land_use_feat["Layer"],
-                    parcel_feat["지번"],
-                    intersection.area(),
-                    parcel_geom.area(),
-                    (intersection.area() / parcel_geom.area()) * 100
-                ]
-                new_feat.setAttributes(attrs)
-                provider.addFeature(new_feat)
+    # geometry 오류 보정
+    if not land_use_geom or land_use_geom.isEmpty():
+        continue
+    land_use_geom = land_use_geom.buffer(0, 1)
+    if not land_use_geom or land_use_geom.isEmpty():
+        continue
+    # 임시 단일 피처 레이어 생성
+    temp_layer = QgsVectorLayer(f"Polygon?crs={crs}", "temp", "memory")
+    temp_provider = temp_layer.dataProvider()
+    temp_feat = QgsFeature()
+    temp_feat.setGeometry(land_use_geom)
+    temp_provider.addFeatures([temp_feat])
+    temp_layer.updateExtents()
+    # 블럭별로 필지 레이어를 클립
+    clip_result = processing.run("qgis:clip", {
+        'INPUT': parcel_layer,
+        'OVERLAY': temp_layer,
+        'OUTPUT': 'memory:clip'
+    })['OUTPUT']
+    for clipped_feat in clip_result.getFeatures():
+        new_feat = QgsFeature()
+        new_feat.setGeometry(clipped_feat.geometry())
+        parcel_no = clipped_feat["지번"] if "지번" in clipped_feat.fields().names() else str(clipped_feat.id())
+        block_area = round(land_use_geom.area(), 2)
+        clip_area = round(clipped_feat.geometry().area(), 2)
+        # 전체면적은 원본 필지 면적에서 가져옴
+        parcel_area = round(parcel_area_dict.get(parcel_no, clip_area), 2)
+        percent = round((clip_area / parcel_area) * 100, 2) if parcel_area > 0 else 0
+        attrs = [
+            land_use_feat["Layer"] if "Layer" in land_use_feat.fields().names() else str(land_use_feat.id()),
+            parcel_no,
+            clip_area,
+            parcel_area,
+            percent
+        ]
+        new_feat.setAttributes(attrs)
+        provider.addFeature(new_feat)
 
 result_layer.updateExtents()
 QgsProject.instance().addMapLayer(result_layer)
 
-print('분석이 완료되었습니다. 결과 레이어가 추가되었습니다.')
+print('클립 방식 분석이 완료되었습니다. 결과 레이어가 추가되었습니다.')
